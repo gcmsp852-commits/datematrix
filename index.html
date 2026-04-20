@@ -563,10 +563,14 @@
         let newColorScanResult = null;
 
         let barcodeDetector = null;
+        let dataMatrixDetector = null;
         if ('BarcodeDetector' in window) {
             try {
                 barcodeDetector = new BarcodeDetector({ formats: ['qr_code'] });
             } catch (e) { console.warn("BarcodeDetector error", e); }
+            try {
+                dataMatrixDetector = new BarcodeDetector({ formats: ['data_matrix'] });
+            } catch (e) { console.warn("DataMatrix BarcodeDetector error", e); }
         }
 
         // --- SHA-256 Implementation (Same as Generator) ---
@@ -3299,12 +3303,17 @@
 
         function dmResultToMatrixItem(dm, anchorQr = null) {
             if (!dm) return null;
-            const anchor = anchorQr && anchorQr.location ? [
-                anchorQr.location.topLeftCorner,
-                anchorQr.location.topRightCorner,
-                anchorQr.location.bottomRightCorner,
-                anchorQr.location.bottomLeftCorner
-            ].filter(Boolean) : null;
+            let anchor = null;
+            if (anchorQr && anchorQr.location) {
+                anchor = [
+                    anchorQr.location.topLeftCorner,
+                    anchorQr.location.topRightCorner,
+                    anchorQr.location.bottomRightCorner,
+                    anchorQr.location.bottomLeftCorner
+                ].filter(Boolean);
+            } else if (anchorQr && anchorQr.points) {
+                anchor = anchorQr.points.filter(Boolean);
+            }
             return {
                 text: dm.text || '',
                 managementCode: dm.managementCode,
@@ -3367,6 +3376,136 @@
                     best.nativeDecoded = true;
                 }
             }
+        }
+
+        function getBarcodePoints(barcode) {
+            if (!barcode) return null;
+            if (barcode.cornerPoints && barcode.cornerPoints.length >= 4) {
+                return Array.from(barcode.cornerPoints).slice(0, 4).map(point => ({ x: point.x, y: point.y }));
+            }
+            const bbox = barcode.boundingBox || barcode;
+            if (!bbox) return null;
+            return [
+                { x: bbox.x, y: bbox.y },
+                { x: bbox.x + bbox.width, y: bbox.y },
+                { x: bbox.x + bbox.width, y: bbox.y + bbox.height },
+                { x: bbox.x, y: bbox.y + bbox.height }
+            ];
+        }
+
+        function getBarcodeBBox(barcode) {
+            const bbox = barcode && barcode.boundingBox ? barcode.boundingBox : barcode;
+            if (bbox && isFinite(bbox.x) && isFinite(bbox.y) && isFinite(bbox.width) && isFinite(bbox.height)) {
+                return { x: bbox.x, y: bbox.y, width: Math.max(1, bbox.width), height: Math.max(1, bbox.height) };
+            }
+            const points = getBarcodePoints(barcode);
+            if (!points || points.length < 3) return null;
+            const xs = points.map(point => point.x);
+            const ys = points.map(point => point.y);
+            return {
+                x: Math.min(...xs),
+                y: Math.min(...ys),
+                width: Math.max(1, Math.max(...xs) - Math.min(...xs)),
+                height: Math.max(1, Math.max(...ys) - Math.min(...ys))
+            };
+        }
+
+        function getMatrixManagementCode32(item) {
+            if (!item) return null;
+            if (item.managementCode32 !== undefined && item.managementCode32 !== null) return item.managementCode32 >>> 0;
+            return getManagementCode32FromParts(item.managementCode, item.managementFlags16);
+        }
+
+        function getMatrixMgmtInfo(item) {
+            const managementCode32 = getMatrixManagementCode32(item);
+            return managementCode32 === null ? null : parseStandardMgmt(managementCode32);
+        }
+
+        function addDecodedMatrixQrItem(items, seen, item) {
+            if (!item || !item.text) return;
+            const mgmtInfo = getMatrixMgmtInfo(item);
+            const qrNo = mgmtInfo ? mgmtInfo.qrNo : null;
+            if (qrNo !== null && qrNo !== 1) return;
+            const firstPoint = item.points && item.points[0] ? item.points[0] : { x: 0, y: 0 };
+            const key = [
+                item.text,
+                qrNo === null ? 'free' : qrNo,
+                Math.round(firstPoint.x / 8),
+                Math.round(firstPoint.y / 8)
+            ].join(':');
+            if (seen.has(key)) return;
+            seen.add(key);
+            item._matrixQrNo = qrNo;
+            item._managed = qrNo !== null;
+            items.push(item);
+        }
+
+        function collectDecodedMatrixQrItems(qrCandidates, nativeBarcodes) {
+            const items = [];
+            const seen = new Set();
+            for (const qr of (qrCandidates || [])) {
+                if (!qr || qr.isRaw || !qr.data) continue;
+                addDecodedMatrixQrItem(items, seen, qrResultToMatrixItem(qr));
+            }
+            for (const barcode of (nativeBarcodes || [])) {
+                const text = barcode && (barcode.rawValue || barcode.rawText || barcode.data);
+                if (!text) continue;
+                addDecodedMatrixQrItem(items, seen, {
+                    text,
+                    managementCode: null,
+                    managementCode32: null,
+                    managementFlags16: null,
+                    managementExt32: null,
+                    points: getBarcodePoints(barcode),
+                    native: true
+                });
+            }
+            items.sort((a, b) => {
+                if (!!a._managed !== !!b._managed) return a._managed ? -1 : 1;
+                if (!!a.native !== !!b.native) return a.native ? 1 : -1;
+                return 0;
+            });
+            return items;
+        }
+
+        function selectMatrixSecondQrItem(qrItems, requireManaged) {
+            for (const item of (qrItems || [])) {
+                const mgmtInfo = getMatrixMgmtInfo(item);
+                const qrNo = mgmtInfo ? mgmtInfo.qrNo : null;
+                if (qrNo !== null) {
+                    if (qrNo === 1) return item;
+                    continue;
+                }
+                if (!requireManaged) return item;
+            }
+            return null;
+        }
+
+        function getMatrixDmDecodeOptions() {
+            return appMask ? { appEncMask: Array.from(appMask) } : {};
+        }
+
+        function decodeNativeQrMatrixDm(imageData, width, height, nativeDataMatrices) {
+            let best = { dm: null, anchor: null, sawRaw: false, bestFinderScore: 0 };
+            if (!nativeDataMatrices || !jsQR.decodeDataMatrixRegion) return best;
+            for (const barcode of nativeDataMatrices) {
+                const points = getBarcodePoints(barcode);
+                const bbox = getBarcodeBBox(barcode);
+                if (!points && !bbox) continue;
+                const region = { points, boundingBox: bbox };
+                let dm = jsQR.decodeDataMatrixRegion(imageData.data, width, height, region, getMatrixDmDecodeOptions());
+                if (appMask && (!dm || dm.isRaw)) {
+                    dm = jsQR.decodeDataMatrixRegion(imageData.data, width, height, region, {});
+                }
+                if (dm && dm.finderScore) best.bestFinderScore = Math.max(best.bestFinderScore, dm.finderScore);
+                if (dm && !dm.isRaw) {
+                    best.dm = dm;
+                    best.anchor = { points };
+                    return best;
+                }
+                if (dm && dm.isRaw && dm.finderScore > 0.72) best.sawRaw = true;
+            }
+            return best;
         }
 
         function collectQrMatrixCandidates(imageData, width, height, needSysDecode, nativeBarcodes = null) {
@@ -3437,34 +3576,79 @@
             }
         }
 
-        async function processQrMatrixFrame(imageData, width, height, nativeBarcodes = null) {
+        async function processQrMatrixFrame(imageData, width, height, nativeBarcodes = null, nativeDataMatrices = null) {
             const needSysDecode = scanMode === 'matrix_digital_sign' || (scanMode === 'matrix_normal' && scanStage === 3 && sysEncStage3);
             const qrCandidates = collectQrMatrixCandidates(imageData, width, height, needSysDecode, nativeBarcodes);
+            const qrPayloadItems = collectDecodedMatrixQrItems(qrCandidates, nativeBarcodes);
+            const requireManagedQr = scanMode === 'matrix_digital_sign' || !!appMask || !!sysEncStage3;
+
+            if (firstQR) {
+                const qrItem = selectMatrixSecondQrItem(qrPayloadItems, requireManagedQr);
+                if (qrItem) {
+                    secondQR = qrItem;
+                    isScanning = false;
+                    isProcessing = false;
+                    if (scanMode === 'matrix_digital_sign') {
+                        statusText.innerText = "電子署名を検証しました";
+                        showResultScreen(verifyMatrixSignature(secondQR.text));
+                    } else {
+                        showResultScreen();
+                    }
+                    return true;
+                }
+                statusText.innerText = scanStage === 3
+                    ? "QRコードを探索中..."
+                    : (scanMode === 'matrix_digital_sign' ? "電子署名QRマトリックスを解析中..." : "QRマトリックスのQRコードを解析中...");
+                return false;
+            }
+
             let sawRawMatrix = false;
             let bestFinderScore = 0;
+            let decodedDm = null;
+            let decodedDmAnchor = null;
 
-            for (const qr of qrCandidates) {
-                const qrMgmtInfo = parseStandardMgmt(qr.managementCode32 !== undefined && qr.managementCode32 !== null
-                    ? qr.managementCode32
-                    : getManagementCode32FromParts(qr.managementCode, qr.managementFlags16));
-                const qrNo = qrMgmtInfo ? qrMgmtInfo.qrNo : null;
-                if (qrNo !== null && qrNo !== 1 && !qr.isRaw) continue;
+            const nativeDm = decodeNativeQrMatrixDm(imageData, width, height, nativeDataMatrices);
+            if (nativeDm.bestFinderScore) bestFinderScore = Math.max(bestFinderScore, nativeDm.bestFinderScore);
+            if (nativeDm.sawRaw) sawRawMatrix = true;
+            if (nativeDm.dm && !nativeDm.dm.isRaw) {
+                decodedDm = nativeDm.dm;
+                decodedDmAnchor = nativeDm.anchor;
+            }
 
-                let dm = jsQR.decodeQRMatrix(imageData.data, width, height, qr, appMask ? { appEncMask: Array.from(appMask) } : {});
-                if (appMask && (!dm || dm.isRaw)) {
-                    // 生成仕様の差異に備え、DM側が平文でQR側だけ暗号化されているケースも拾う。
-                    dm = jsQR.decodeQRMatrix(imageData.data, width, height, qr, {});
+            if (!decodedDm) {
+                for (const qr of qrCandidates) {
+                    const qrMgmtInfo = getMatrixMgmtInfo(qr);
+                    const qrNo = qrMgmtInfo ? qrMgmtInfo.qrNo : null;
+                    if (qrNo !== null && qrNo !== 1 && !qr.isRaw) continue;
+
+                    let dm = jsQR.decodeQRMatrix(imageData.data, width, height, qr, getMatrixDmDecodeOptions());
+                    if (appMask && (!dm || dm.isRaw)) {
+                        dm = jsQR.decodeQRMatrix(imageData.data, width, height, qr, {});
+                    }
+                    if (dm && dm.finderScore) bestFinderScore = Math.max(bestFinderScore, dm.finderScore);
+                    if (!dm || dm.isRaw) {
+                        if (qr.isRaw || (dm && dm.finderScore && dm.finderScore > 0.72)) sawRawMatrix = true;
+                        continue;
+                    }
+
+                    const dmMgmtInfo = getMatrixMgmtInfo(dm);
+                    if (!dmMgmtInfo || dmMgmtInfo.qrNo !== 0) continue;
+                    decodedDm = dm;
+                    decodedDmAnchor = qr;
+                    break;
                 }
-                if (dm && dm.finderScore) bestFinderScore = Math.max(bestFinderScore, dm.finderScore);
-                if (!dm || dm.isRaw) {
-                    if (qr.isRaw || (dm && dm.finderScore && dm.finderScore > 0.72)) sawRawMatrix = true;
-                    continue;
+            }
+
+            if (decodedDm) {
+                const dmMgmtInfo = getMatrixMgmtInfo(decodedDm);
+                if (!dmMgmtInfo || dmMgmtInfo.qrNo !== 0) {
+                    statusText.innerText = scanMode === 'matrix_digital_sign'
+                        ? "電子署名QRマトリックスを解析中..."
+                        : "QRマトリックスを解析中...";
+                    return false;
                 }
 
-                const dmMgmtInfo = parseStandardMgmt(dm.managementCode, dm.managementFlags16);
-                if (!dmMgmtInfo || dmMgmtInfo.qrNo !== 0) continue;
-
-                const dmItem = dmResultToMatrixItem(dm, qr);
+                const dmItem = dmResultToMatrixItem(decodedDm, decodedDmAnchor);
                 const accessError = await validateMatrixFirstData(dmItem);
                 if (accessError) {
                     isScanning = false;
@@ -3473,54 +3657,55 @@
                     return true;
                 }
 
+                firstQR = dmItem;
+                if (dmItem.points && dmItem.points.length === 4) drawBoundingBox(dmItem.points, '#00E676');
+
                 if (scanMode === 'matrix_digital_sign') {
-                    if (!qr.data || qr.isRaw) continue;
-                    firstQR = dmItem;
-                    secondQR = qrResultToMatrixItem(qr);
-                    if (dmItem.points && dmItem.points.length === 4) drawBoundingBox(dmItem.points, '#00E676');
-                    const signatureResult = verifyMatrixSignature(secondQR.text);
-                    isScanning = false;
+                    const signatureQr = selectMatrixSecondQrItem(qrPayloadItems, true);
+                    if (signatureQr) {
+                        secondQR = signatureQr;
+                        isScanning = false;
+                        isProcessing = false;
+                        statusText.innerText = "電子署名を検証しました";
+                        showResultScreen(verifyMatrixSignature(secondQR.text));
+                        return true;
+                    }
+                    statusText.innerText = "電子署名QRマトリックスを解析中...";
+                    return false;
+                }
+
+                if (dmMgmtInfo.appEncFlag && !appMask) {
                     isProcessing = false;
-                    statusText.innerText = "電子署名を検証しました";
-                    showResultScreen(signatureResult);
+                    showPasswordScreen(dmItem.text, 'データマトリックスを読取済み。QRコード復号用のパスワード入力待ちです。');
                     return true;
                 }
 
-                if (scanStage === 1) {
-                    firstQR = dmItem;
-                    if (dmItem.points && dmItem.points.length === 4) drawBoundingBox(dmItem.points, '#00E676');
+                if (dmMgmtInfo.appEncFlag && appMask) {
+                    scanStage = 3;
+                    if (firstQR) firstQR.points = null;
+                    statusText.innerText = "QRコード（ユーザ暗号化）を探索中...";
+                    return false;
+                }
 
-                    if (dmMgmtInfo.appEncFlag && !appMask) {
-                        isProcessing = false;
-                        showPasswordScreen(dmItem.text, 'データマトリックスを読取済み。QRコード復号用のパスワード入力待ちです。');
-                        return true;
-                    }
-                    if (dmMgmtInfo.sysEncFlag && !sysEncStage3) {
-                        isProcessing = false;
-                        showSysEncScreen();
-                        return true;
-                    }
-                    if (!qr.data || qr.isRaw) {
-                        scanStage = 3;
-                        statusText.innerText = "QRコードを探索中...";
-                        return true;
-                    }
-                    secondQR = qrResultToMatrixItem(qr);
+                if (dmMgmtInfo.sysEncFlag && !sysEncStage3) {
+                    isProcessing = false;
+                    showSysEncScreen();
+                    return true;
+                }
+
+                const secondItem = selectMatrixSecondQrItem(qrPayloadItems, !!sysEncStage3);
+                if (secondItem) {
+                    secondQR = secondItem;
                     isScanning = false;
                     isProcessing = false;
                     showResultScreen();
                     return true;
                 }
 
-                if (scanStage === 3) {
-                    if (!firstQR) firstQR = dmItem;
-                    if (!qr.data || qr.isRaw) continue;
-                    secondQR = qrResultToMatrixItem(qr);
-                    isScanning = false;
-                    isProcessing = false;
-                    showResultScreen();
-                    return true;
-                }
+                statusText.innerText = sysEncStage3
+                    ? "QRコード（システム暗号化）を探索中..."
+                    : "QRマトリックスのQRコードを解析中...";
+                return false;
             }
 
             if (scanMode === 'matrix_normal' && scanStage === 1 && !appMask && sawRawMatrix && bestFinderScore > 0.72) {
@@ -3721,6 +3906,7 @@
                         zxingCtx.drawImage(video, 0, 0, vw, vh);
                         const fullData = zxingCtx.getImageData(0, 0, vw, vh);
                         let nativeBarcodes = null;
+                        let nativeDataMatrices = null;
                         if (barcodeDetector) {
                             try {
                                 nativeBarcodes = await barcodeDetector.detect(video);
@@ -3728,7 +3914,14 @@
                                 nativeBarcodes = null;
                             }
                         }
-                        const handled = await processQrMatrixFrame(fullData, vw, vh, nativeBarcodes);
+                        if (dataMatrixDetector) {
+                            try {
+                                nativeDataMatrices = await dataMatrixDetector.detect(video);
+                            } catch (err) {
+                                nativeDataMatrices = null;
+                            }
+                        }
+                        const handled = await processQrMatrixFrame(fullData, vw, vh, nativeBarcodes, nativeDataMatrices);
                         isProcessing = false;
                         if (!handled && isScanning) requestAnimationFrame(scanLoop);
                         return;

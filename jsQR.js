@@ -10929,6 +10929,138 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         return total ? ok / total : 0;
     }
 
+    function rotateCellsCW(cells) {
+        var n = cells.length;
+        var out = new Array(n);
+        for (var r = 0; r < n; r++) {
+            out[r] = new Array(n);
+            for (var c = 0; c < n; c++) out[r][c] = !!cells[n - 1 - c][r];
+        }
+        return out;
+    }
+
+    function mirrorCellsH(cells) {
+        var n = cells.length;
+        var out = new Array(n);
+        for (var r = 0; r < n; r++) {
+            out[r] = new Array(n);
+            for (var c = 0; c < n; c++) out[r][c] = !!cells[r][n - 1 - c];
+        }
+        return out;
+    }
+
+    function decodeDataMatrixAnyOrientation(cells, options) {
+        var current = cells;
+        var bestFinder = 0;
+        for (var rot = 0; rot < 4; rot++) {
+            var variants = [current, mirrorCellsH(current)];
+            for (var v = 0; v < variants.length; v++) {
+                var candidate = variants[v];
+                var finderScore = scoreDataMatrixFinder(candidate);
+                if (finderScore > bestFinder) bestFinder = finderScore;
+                if (finderScore < 0.62) continue;
+                var decoded = dmDecodeCells(candidate, options);
+                if (decoded) {
+                    decoded.cells = candidate;
+                    decoded.finderScore = finderScore;
+                    return decoded;
+                }
+            }
+            current = rotateCellsCW(current);
+        }
+        return { isRaw: true, finderScore: bestFinder };
+    }
+
+    function normalizeRegionQuad(region) {
+        if (!region) return null;
+        var points = region.points || region.cornerPoints || region.corners || null;
+        if (points && points.length >= 4) {
+            var arr = [];
+            for (var i = 0; i < 4; i++) {
+                if (!points[i]) return null;
+                arr.push({ x: Number(points[i].x), y: Number(points[i].y) });
+            }
+            var tl = arr[0], tr = arr[0], br = arr[0], bl = arr[0];
+            for (var p = 1; p < arr.length; p++) {
+                var point = arr[p];
+                if (point.x + point.y < tl.x + tl.y) tl = point;
+                if (point.x + point.y > br.x + br.y) br = point;
+                if (point.x - point.y > tr.x - tr.y) tr = point;
+                if (point.x - point.y < bl.x - bl.y) bl = point;
+            }
+            return [tl, tr, br, bl];
+        }
+        var box = region.boundingBox || region;
+        if (box && isFinite(box.x) && isFinite(box.y) && isFinite(box.width) && isFinite(box.height)) {
+            return [
+                { x: box.x, y: box.y },
+                { x: box.x + box.width, y: box.y },
+                { x: box.x + box.width, y: box.y + box.height },
+                { x: box.x, y: box.y + box.height }
+            ];
+        }
+        return null;
+    }
+
+    function scaleQuad(quad, scale) {
+        if (scale === 1) return quad;
+        var cx = 0, cy = 0;
+        for (var i = 0; i < 4; i++) { cx += quad[i].x; cy += quad[i].y; }
+        cx /= 4; cy /= 4;
+        var out = new Array(4);
+        for (var p = 0; p < 4; p++) {
+            out[p] = {
+                x: cx + (quad[p].x - cx) * scale,
+                y: cy + (quad[p].y - cy) * scale
+            };
+        }
+        return out;
+    }
+
+    function quadAverageSide(quad) {
+        var sum = 0;
+        for (var i = 0; i < 4; i++) {
+            var a = quad[i], b = quad[(i + 1) % 4];
+            sum += Math.hypot(b.x - a.x, b.y - a.y);
+        }
+        return sum / 4;
+    }
+
+    function sampleDataMatrixQuad(imageData, width, height, quad, dmSize) {
+        var display = new Array(dmSize);
+        var lumSamples = [];
+        var avgSide = quadAverageSide(quad);
+        var radius = Math.max(1, Math.round((avgSide / dmSize) * 0.13));
+        var tl = quad[0], tr = quad[1], br = quad[2], bl = quad[3];
+        for (var r = 0; r < dmSize; r++) {
+            display[r] = new Array(dmSize);
+            var v = (r + 0.5) / dmSize;
+            for (var c = 0; c < dmSize; c++) {
+                var u = (c + 0.5) / dmSize;
+                var px = (1 - u) * (1 - v) * tl.x + u * (1 - v) * tr.x + u * v * br.x + (1 - u) * v * bl.x;
+                var py = (1 - u) * (1 - v) * tl.y + u * (1 - v) * tr.y + u * v * br.y + (1 - u) * v * bl.y;
+                if (px < 0 || py < 0 || px >= width || py >= height) {
+                    display[r][c] = false;
+                    lumSamples.push(255);
+                    continue;
+                }
+                var sample = lumaAt(imageData, width, height, px, py, radius);
+                lumSamples.push(sample.luma);
+                display[r][c] = sample.luma < 190 || sample.chromaDark > 18;
+            }
+        }
+        var sorted = lumSamples.slice(0).sort(function(a, b) { return a - b; });
+        var low = sorted[Math.floor(sorted.length * 0.18)] || 0;
+        var high = sorted[Math.floor(sorted.length * 0.82)] || 255;
+        var threshold = Math.max(40, Math.min(225, (low + high) / 2));
+        if (high - low > 20) {
+            for (var rr = 0, k = 0; rr < dmSize; rr++) {
+                for (var cc = 0; cc < dmSize; cc++, k++) display[rr][cc] = lumSamples[k] <= threshold;
+            }
+        }
+        return display;
+    }
+
     function sampleQRMatrixDataMatrix(imageData, width, height, qrResult, dmSize) {
         var versionNumber = getQRMatrixVersionNumber(qrResult);
         if (!qrResult || !qrResult.location || !versionNumber) return null;
@@ -10975,6 +11107,33 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
     api.decodeDataMatrixCells = function(cells, options) {
         try { return dmDecodeCells(cells, options || {}); } catch (e) { return null; }
+    };
+
+    api.decodeDataMatrixRegion = function(imageData, width, height, region, options) {
+        options = options || {};
+        var data = imageData && imageData.data ? imageData.data : imageData;
+        var quad = normalizeRegionQuad(region);
+        if (!data || !quad) return null;
+        var avgSide = quadAverageSide(quad);
+        var candidates = DM_SYMBOLS.map(function(s) { return s.size; }).sort(function(a, b) { return b - a; });
+        var scales = [1, 0.92, 0.84, 0.76, 0.68, 1.08];
+        var bestFinder = 0;
+        for (var si = 0; si < scales.length; si++) {
+            var q = scaleQuad(quad, scales[si]);
+            for (var ci = 0; ci < candidates.length; ci++) {
+                var size = candidates[ci];
+                if (avgSide * scales[si] / size < 1.05) continue;
+                var cells = sampleDataMatrixQuad(data, width, height, q, size);
+                var decoded = decodeDataMatrixAnyOrientation(cells, options);
+                if (decoded && decoded.finderScore) bestFinder = Math.max(bestFinder, decoded.finderScore);
+                if (decoded && !decoded.isRaw) {
+                    decoded.symbolSize = decoded.symbolSize || size;
+                    decoded.region = region;
+                    return decoded;
+                }
+            }
+        }
+        return { isRaw: true, finderScore: bestFinder };
     };
 
     api.decodeQRMatrix = function(imageData, width, height, qrResult, options) {
