@@ -3261,6 +3261,13 @@
             return scanMode === 'matrix_normal' || scanMode === 'matrix_digital_sign';
         }
 
+        function getQrResultVersionNumber(qr) {
+            if (!qr) return null;
+            if (typeof qr.version === 'number') return qr.version;
+            if (qr.version && typeof qr.version.versionNumber === 'number') return qr.version.versionNumber;
+            return null;
+        }
+
         function qrResultToMatrixItem(qr) {
             if (!qr) return null;
             const loc = qr.location;
@@ -3285,7 +3292,7 @@
                 points,
                 codewords: qr.codewords,
                 dataBytes: qr.dataBytes,
-                version: qr.version,
+                version: getQrResultVersionNumber(qr),
                 raw: !!qr.isRaw
             };
         }
@@ -3322,12 +3329,13 @@
             if (!qrList) return;
             const arr = Array.isArray(qrList) ? qrList : [qrList];
             for (const qr of arr) {
-                if (!qr || !qr.location || typeof qr.version !== 'number') continue;
+                const versionNumber = getQrResultVersionNumber(qr);
+                if (!qr || !qr.location || !versionNumber) continue;
                 const tl = qr.location.topLeftCorner || { x: 0, y: 0 };
                 const key = [
                     Math.round(tl.x / 6),
                     Math.round(tl.y / 6),
-                    qr.version,
+                    versionNumber,
                     qr.isRaw ? 'raw' : (qr.managementCode32 || qr.data || '')
                 ].join(':');
                 if (seen.has(key)) continue;
@@ -3336,7 +3344,32 @@
             }
         }
 
-        function collectQrMatrixCandidates(imageData, width, height, needSysDecode) {
+        function mergeNativeQrTextIntoCandidates(candidates, nativeBarcodes) {
+            if (!candidates || !nativeBarcodes || nativeBarcodes.length === 0) return;
+            for (const barcode of nativeBarcodes) {
+                const text = barcode && (barcode.rawValue || barcode.rawText || barcode.data);
+                const bbox = barcode && barcode.boundingBox;
+                if (!text || !bbox) continue;
+                let best = null;
+                let bestArea = 0;
+                for (const qr of candidates) {
+                    if (!qr || !qr.location) continue;
+                    const qrBox = getQrLocationBBox(qr.location);
+                    const area = rectIntersectionArea(qrBox, bbox);
+                    if (area > bestArea) {
+                        bestArea = area;
+                        best = qr;
+                    }
+                }
+                if (best && bestArea > 0) {
+                    best.data = text;
+                    best.isRaw = false;
+                    best.nativeDecoded = true;
+                }
+            }
+        }
+
+        function collectQrMatrixCandidates(imageData, width, height, needSysDecode, nativeBarcodes = null) {
             const candidates = [];
             const seen = new Set();
             const base = { inversionAttempts: 'attemptBoth', multi: true, extractRawForFailed: true };
@@ -3357,6 +3390,7 @@
                 const br = b.isRaw ? 1 : 0;
                 return ar - br;
             });
+            mergeNativeQrTextIntoCandidates(candidates, nativeBarcodes);
             return candidates;
         }
 
@@ -3403,9 +3437,9 @@
             }
         }
 
-        async function processQrMatrixFrame(imageData, width, height) {
+        async function processQrMatrixFrame(imageData, width, height, nativeBarcodes = null) {
             const needSysDecode = scanMode === 'matrix_digital_sign' || (scanMode === 'matrix_normal' && scanStage === 3 && sysEncStage3);
-            const qrCandidates = collectQrMatrixCandidates(imageData, width, height, needSysDecode);
+            const qrCandidates = collectQrMatrixCandidates(imageData, width, height, needSysDecode, nativeBarcodes);
             let sawRawMatrix = false;
             let bestFinderScore = 0;
 
@@ -3686,7 +3720,15 @@
                         zxingCanvas.height = vh;
                         zxingCtx.drawImage(video, 0, 0, vw, vh);
                         const fullData = zxingCtx.getImageData(0, 0, vw, vh);
-                        const handled = await processQrMatrixFrame(fullData, vw, vh);
+                        let nativeBarcodes = null;
+                        if (barcodeDetector) {
+                            try {
+                                nativeBarcodes = await barcodeDetector.detect(video);
+                            } catch (err) {
+                                nativeBarcodes = null;
+                            }
+                        }
+                        const handled = await processQrMatrixFrame(fullData, vw, vh, nativeBarcodes);
                         isProcessing = false;
                         if (!handled && isScanning) requestAnimationFrame(scanLoop);
                         return;

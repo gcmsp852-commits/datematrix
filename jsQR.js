@@ -10906,6 +10906,13 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         return out;
     }
 
+    function getQRMatrixVersionNumber(qrResult) {
+        if (!qrResult) return null;
+        if (typeof qrResult.version === "number") return qrResult.version;
+        if (qrResult.version && typeof qrResult.version.versionNumber === "number") return qrResult.version.versionNumber;
+        return null;
+    }
+
     function scoreDataMatrixFinder(cells) {
         var n = cells.length;
         var ok = 0, total = 0;
@@ -10923,11 +10930,12 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
 
     function sampleQRMatrixDataMatrix(imageData, width, height, qrResult, dmSize) {
-        if (!qrResult || !qrResult.location || typeof qrResult.version !== "number") return null;
+        var versionNumber = getQRMatrixVersionNumber(qrResult);
+        if (!qrResult || !qrResult.location || !versionNumber) return null;
         var loc = qrResult.location;
         var tl = loc.topLeftCorner, tr = loc.topRightCorner, bl = loc.bottomLeftCorner;
         if (!tl || !tr || !bl) return null;
-        var nqr = 17 + 4 * qrResult.version;
+        var nqr = 17 + 4 * versionNumber;
         if (nqr <= 0 || dmSize > nqr) return null;
         var stepX = { x: (tr.x - tl.x) / nqr, y: (tr.y - tl.y) / nqr };
         var stepY = { x: (bl.x - tl.x) / nqr, y: (bl.y - tl.y) / nqr };
@@ -10972,8 +10980,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     api.decodeQRMatrix = function(imageData, width, height, qrResult, options) {
         options = options || {};
         var data = imageData && imageData.data ? imageData.data : imageData;
-        if (!data || !qrResult || typeof qrResult.version !== "number") return null;
-        var nqr = 17 + 4 * qrResult.version;
+        var versionNumber = getQRMatrixVersionNumber(qrResult);
+        if (!data || !qrResult || !versionNumber) return null;
+        var nqr = 17 + 4 * versionNumber;
         var candidates = [];
         for (var i = 0; i < DM_SYMBOLS.length; i++) {
             if (DM_SYMBOLS[i].size <= nqr - 8) candidates.push(DM_SYMBOLS[i].size);
