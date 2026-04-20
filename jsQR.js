@@ -10361,3 +10361,640 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
 
 
+// QR Matrix extension: decode the Data Matrix layer placed relative to a decoded QR.
+(function(root) {
+    "use strict";
+
+    var api = root && root.jsQR;
+    if (typeof module !== "undefined" && module.exports) api = module.exports;
+    if (!api) return;
+
+    var DM_SYMBOLS = [
+        { size:10, data:3,    ecc:5,   blocks:1, regions:[1,1], mapping:8   },
+        { size:12, data:5,    ecc:7,   blocks:1, regions:[1,1], mapping:10  },
+        { size:14, data:8,    ecc:10,  blocks:1, regions:[1,1], mapping:12  },
+        { size:16, data:12,   ecc:12,  blocks:1, regions:[1,1], mapping:14  },
+        { size:18, data:18,   ecc:14,  blocks:1, regions:[1,1], mapping:16  },
+        { size:20, data:22,   ecc:18,  blocks:1, regions:[1,1], mapping:18  },
+        { size:22, data:30,   ecc:20,  blocks:1, regions:[1,1], mapping:20  },
+        { size:24, data:36,   ecc:24,  blocks:1, regions:[1,1], mapping:22  },
+        { size:26, data:44,   ecc:28,  blocks:1, regions:[1,1], mapping:24  },
+        { size:32, data:62,   ecc:36,  blocks:1, regions:[2,2], mapping:28  },
+        { size:36, data:86,   ecc:42,  blocks:1, regions:[2,2], mapping:32  },
+        { size:40, data:114,  ecc:48,  blocks:1, regions:[2,2], mapping:36  },
+        { size:44, data:144,  ecc:56,  blocks:1, regions:[2,2], mapping:40  },
+        { size:48, data:174,  ecc:68,  blocks:1, regions:[2,2], mapping:44  },
+        { size:52, data:204,  ecc:84,  blocks:2, regions:[2,2], mapping:48  },
+        { size:64, data:280,  ecc:112, blocks:2, regions:[4,4], mapping:56  },
+        { size:72, data:368,  ecc:144, blocks:4, regions:[4,4], mapping:64  },
+        { size:80, data:456,  ecc:192, blocks:4, regions:[4,4], mapping:72  },
+        { size:88, data:576,  ecc:224, blocks:4, regions:[4,4], mapping:80  },
+        { size:96, data:696,  ecc:272, blocks:4, regions:[4,4], mapping:88  },
+        { size:104,data:816,  ecc:336, blocks:6, regions:[4,4], mapping:96  },
+        { size:120,data:1050, ecc:408, blocks:6, regions:[6,6], mapping:108 },
+        { size:132,data:1304, ecc:496, blocks:8, regions:[6,6], mapping:120 },
+        { size:144,data:1558, ecc:620, blocks:10,regions:[6,6], mapping:132 }
+    ];
+
+    function dmSymbolBySize(size) {
+        for (var i = 0; i < DM_SYMBOLS.length; i++) {
+            if (DM_SYMBOLS[i].size === size) return DM_SYMBOLS[i];
+        }
+        return null;
+    }
+
+    function addOrSubtractGF(a, b) { return a ^ b; }
+
+    function GenericGF(primitive, size, genBase) {
+        this.primitive = primitive;
+        this.size = size;
+        this.generatorBase = genBase;
+        this.expTable = new Array(size);
+        this.logTable = new Array(size);
+        var x = 1;
+        for (var i = 0; i < size; i++) {
+            this.expTable[i] = x;
+            x *= 2;
+            if (x >= size) x = (x ^ primitive) & (size - 1);
+        }
+        for (var j = 0; j < size - 1; j++) this.logTable[this.expTable[j]] = j;
+        this.zero = new GenericGFPoly(this, [0]);
+        this.one = new GenericGFPoly(this, [1]);
+    }
+    GenericGF.prototype.multiply = function(a, b) {
+        if (a === 0 || b === 0) return 0;
+        return this.expTable[(this.logTable[a] + this.logTable[b]) % (this.size - 1)];
+    };
+    GenericGF.prototype.inverse = function(a) {
+        if (a === 0) throw new Error("Can't invert 0");
+        return this.expTable[this.size - this.logTable[a] - 1];
+    };
+    GenericGF.prototype.buildMonomial = function(degree, coefficient) {
+        if (degree < 0) throw new Error("Invalid monomial degree");
+        if (coefficient === 0) return this.zero;
+        var coefficients = new Array(degree + 1).fill(0);
+        coefficients[0] = coefficient;
+        return new GenericGFPoly(this, coefficients);
+    };
+    GenericGF.prototype.log = function(a) {
+        if (a === 0) throw new Error("Can't take log(0)");
+        return this.logTable[a];
+    };
+    GenericGF.prototype.exp = function(a) { return this.expTable[a]; };
+
+    function GenericGFPoly(field, coefficients) {
+        if (!coefficients.length) throw new Error("No coefficients.");
+        this.field = field;
+        var firstNonZero = 0;
+        while (firstNonZero < coefficients.length - 1 && coefficients[firstNonZero] === 0) firstNonZero++;
+        this.coefficients = coefficients.slice(firstNonZero);
+    }
+    GenericGFPoly.prototype.degree = function() { return this.coefficients.length - 1; };
+    GenericGFPoly.prototype.isZero = function() { return this.coefficients[0] === 0; };
+    GenericGFPoly.prototype.getCoefficient = function(degree) {
+        return this.coefficients[this.coefficients.length - 1 - degree];
+    };
+    GenericGFPoly.prototype.addOrSubtract = function(other) {
+        if (this.isZero()) return other;
+        if (other.isZero()) return this;
+        var smaller = this.coefficients;
+        var larger = other.coefficients;
+        if (smaller.length > larger.length) {
+            var tmp = smaller; smaller = larger; larger = tmp;
+        }
+        var sum = larger.slice(0);
+        var diff = larger.length - smaller.length;
+        for (var i = 0; i < smaller.length; i++) {
+            sum[i + diff] = addOrSubtractGF(smaller[i], larger[i + diff]);
+        }
+        return new GenericGFPoly(this.field, sum);
+    };
+    GenericGFPoly.prototype.multiply = function(scalar) {
+        if (scalar === 0) return this.field.zero;
+        if (scalar === 1) return this;
+        var product = new Array(this.coefficients.length);
+        for (var i = 0; i < product.length; i++) {
+            product[i] = this.field.multiply(this.coefficients[i], scalar);
+        }
+        return new GenericGFPoly(this.field, product);
+    };
+    GenericGFPoly.prototype.multiplyPoly = function(other) {
+        if (this.isZero() || other.isZero()) return this.field.zero;
+        var product = new Array(this.coefficients.length + other.coefficients.length - 1).fill(0);
+        for (var i = 0; i < this.coefficients.length; i++) {
+            for (var j = 0; j < other.coefficients.length; j++) {
+                product[i + j] = addOrSubtractGF(product[i + j], this.field.multiply(this.coefficients[i], other.coefficients[j]));
+            }
+        }
+        return new GenericGFPoly(this.field, product);
+    };
+    GenericGFPoly.prototype.multiplyByMonomial = function(degree, coefficient) {
+        if (degree < 0) throw new Error("Invalid degree");
+        if (coefficient === 0) return this.field.zero;
+        var product = new Array(this.coefficients.length + degree).fill(0);
+        for (var i = 0; i < this.coefficients.length; i++) {
+            product[i] = this.field.multiply(this.coefficients[i], coefficient);
+        }
+        return new GenericGFPoly(this.field, product);
+    };
+    GenericGFPoly.prototype.evaluateAt = function(a) {
+        if (a === 0) return this.getCoefficient(0);
+        var result = 0;
+        if (a === 1) {
+            for (var i = 0; i < this.coefficients.length; i++) result = addOrSubtractGF(result, this.coefficients[i]);
+            return result;
+        }
+        result = this.coefficients[0];
+        for (var j = 1; j < this.coefficients.length; j++) {
+            result = addOrSubtractGF(this.field.multiply(a, result), this.coefficients[j]);
+        }
+        return result;
+    };
+
+    function runEuclideanAlgorithm(field, a, b, R) {
+        if (a.degree() < b.degree()) { var swap = a; a = b; b = swap; }
+        var rLast = a, r = b, tLast = field.zero, t = field.one;
+        while (r.degree() >= R / 2) {
+            var rLastLast = rLast;
+            var tLastLast = tLast;
+            rLast = r;
+            tLast = t;
+            if (rLast.isZero()) return null;
+            r = rLastLast;
+            var q = field.zero;
+            var denominatorLeadingTerm = rLast.getCoefficient(rLast.degree());
+            var dltInverse = field.inverse(denominatorLeadingTerm);
+            while (r.degree() >= rLast.degree() && !r.isZero()) {
+                var degreeDiff = r.degree() - rLast.degree();
+                var scale = field.multiply(r.getCoefficient(r.degree()), dltInverse);
+                q = q.addOrSubtract(field.buildMonomial(degreeDiff, scale));
+                r = r.addOrSubtract(rLast.multiplyByMonomial(degreeDiff, scale));
+            }
+            t = q.multiplyPoly(tLast).addOrSubtract(tLastLast);
+            if (r.degree() >= rLast.degree()) return null;
+        }
+        var sigmaTildeAtZero = t.getCoefficient(0);
+        if (sigmaTildeAtZero === 0) return null;
+        var inverse = field.inverse(sigmaTildeAtZero);
+        return [t.multiply(inverse), r.multiply(inverse)];
+    }
+
+    function findErrorLocations(field, errorLocator) {
+        var numErrors = errorLocator.degree();
+        if (numErrors === 1) return [errorLocator.getCoefficient(1)];
+        var result = new Array(numErrors);
+        var errorCount = 0;
+        for (var i = 1; i < field.size && errorCount < numErrors; i++) {
+            if (errorLocator.evaluateAt(i) === 0) result[errorCount++] = field.inverse(i);
+        }
+        return errorCount === numErrors ? result : null;
+    }
+
+    function findErrorMagnitudes(field, errorEvaluator, errorLocations) {
+        var s = errorLocations.length;
+        var result = new Array(s);
+        for (var i = 0; i < s; i++) {
+            var xiInverse = field.inverse(errorLocations[i]);
+            var denominator = 1;
+            for (var j = 0; j < s; j++) {
+                if (i !== j) denominator = field.multiply(denominator, addOrSubtractGF(1, field.multiply(errorLocations[j], xiInverse)));
+            }
+            result[i] = field.multiply(errorEvaluator.evaluateAt(xiInverse), field.inverse(denominator));
+            if (field.generatorBase !== 0) result[i] = field.multiply(result[i], xiInverse);
+        }
+        return result;
+    }
+
+    var DM_FIELD = new GenericGF(0x12D, 256, 1);
+    function dmRsDecode(bytes, twoS) {
+        var output = bytes.slice(0);
+        var poly = new GenericGFPoly(DM_FIELD, output);
+        var syndromeCoefficients = new Array(twoS).fill(0);
+        var error = false;
+        for (var s = 0; s < twoS; s++) {
+            var evaluation = poly.evaluateAt(DM_FIELD.exp(s + DM_FIELD.generatorBase));
+            syndromeCoefficients[syndromeCoefficients.length - 1 - s] = evaluation;
+            if (evaluation !== 0) error = true;
+        }
+        if (!error) return output;
+        var syndrome = new GenericGFPoly(DM_FIELD, syndromeCoefficients);
+        var sigmaOmega = runEuclideanAlgorithm(DM_FIELD, DM_FIELD.buildMonomial(twoS, 1), syndrome, twoS);
+        if (sigmaOmega === null) return null;
+        var errorLocations = findErrorLocations(DM_FIELD, sigmaOmega[0]);
+        if (errorLocations === null) return null;
+        var errorMagnitudes = findErrorMagnitudes(DM_FIELD, sigmaOmega[1], errorLocations);
+        for (var i = 0; i < errorLocations.length; i++) {
+            var position = output.length - 1 - DM_FIELD.log(errorLocations[i]);
+            if (position < 0) return null;
+            output[position] = addOrSubtractGF(output[position], errorMagnitudes[i]);
+        }
+        return output;
+    }
+
+    function dmPlacementArray(nrow, ncol) {
+        var array = [];
+        for (var r = 0; r < nrow; r++) array[r] = new Array(ncol).fill(null);
+        function place(row, col, charIdx, bit) {
+            var rr = row, cc = col;
+            if (rr < 0) { rr += nrow; cc += 4 - ((nrow + 4) % 8); }
+            if (cc < 0) { cc += ncol; rr += 4 - ((ncol + 4) % 8); }
+            if (rr >= 0 && rr < nrow && cc >= 0 && cc < ncol) array[rr][cc] = { charIdx: charIdx, bit: bit };
+        }
+        function utah(row, col, charIdx) {
+            place(row - 2, col - 2, charIdx, 0);
+            place(row - 2, col - 1, charIdx, 1);
+            place(row - 1, col - 2, charIdx, 2);
+            place(row - 1, col - 1, charIdx, 3);
+            place(row - 1, col,     charIdx, 4);
+            place(row,     col - 2, charIdx, 5);
+            place(row,     col - 1, charIdx, 6);
+            place(row,     col,     charIdx, 7);
+        }
+        function corner1(charIdx) {
+            place(nrow - 1, 0,         charIdx, 0);
+            place(nrow - 1, 1,         charIdx, 1);
+            place(nrow - 1, 2,         charIdx, 2);
+            place(0,        ncol - 2,  charIdx, 3);
+            place(0,        ncol - 1,  charIdx, 4);
+            place(1,        ncol - 1,  charIdx, 5);
+            place(2,        ncol - 1,  charIdx, 6);
+            place(3,        ncol - 1,  charIdx, 7);
+        }
+        function corner2(charIdx) {
+            place(nrow - 3, 0,         charIdx, 0);
+            place(nrow - 2, 0,         charIdx, 1);
+            place(nrow - 1, 0,         charIdx, 2);
+            place(0,        ncol - 4,  charIdx, 3);
+            place(0,        ncol - 3,  charIdx, 4);
+            place(0,        ncol - 2,  charIdx, 5);
+            place(0,        ncol - 1,  charIdx, 6);
+            place(1,        ncol - 1,  charIdx, 7);
+        }
+        function corner3(charIdx) {
+            place(nrow - 3, 0,         charIdx, 0);
+            place(nrow - 2, 0,         charIdx, 1);
+            place(nrow - 1, 0,         charIdx, 2);
+            place(0,        ncol - 2,  charIdx, 3);
+            place(0,        ncol - 1,  charIdx, 4);
+            place(1,        ncol - 1,  charIdx, 5);
+            place(2,        ncol - 1,  charIdx, 6);
+            place(3,        ncol - 1,  charIdx, 7);
+        }
+        function corner4(charIdx) {
+            place(nrow - 1, 0,         charIdx, 0);
+            place(nrow - 1, ncol - 1,  charIdx, 1);
+            place(0,        ncol - 3,  charIdx, 2);
+            place(0,        ncol - 2,  charIdx, 3);
+            place(0,        ncol - 1,  charIdx, 4);
+            place(1,        ncol - 3,  charIdx, 5);
+            place(1,        ncol - 2,  charIdx, 6);
+            place(1,        ncol - 1,  charIdx, 7);
+        }
+
+        var charIdx = 0;
+        var row = 4;
+        var col = 0;
+        do {
+            if (row === nrow && col === 0) corner1(charIdx++);
+            else if (row === nrow - 2 && col === 0 && ncol % 4 !== 0) corner2(charIdx++);
+            else if (row === nrow - 2 && col === 0 && ncol % 8 === 4) corner3(charIdx++);
+            else if (row === nrow + 4 && col === 2 && ncol % 8 === 0) corner4(charIdx++);
+            do {
+                if (row < nrow && col >= 0 && array[row][col] === null) utah(row, col, charIdx++);
+                row -= 2;
+                col += 2;
+            } while (row >= 0 && col < ncol);
+            row += 1;
+            col += 3;
+            do {
+                if (row >= 0 && col < ncol && array[row][col] === null) utah(row, col, charIdx++);
+                row += 2;
+                col -= 2;
+            } while (row < nrow && col >= 0);
+            row += 3;
+            col += 1;
+        } while (row < nrow || col < ncol);
+        return array;
+    }
+
+    function dmExtractMapping(cells, symbol) {
+        var size = symbol.size;
+        var regions = symbol.regions;
+        var regionRows = regions[0], regionCols = regions[1];
+        var regionDataRows = symbol.mapping / regionRows;
+        var regionDataCols = symbol.mapping / regionCols;
+        var mapping = [];
+        for (var r = 0; r < symbol.mapping; r++) mapping[r] = new Array(symbol.mapping).fill(false);
+        for (var ri = 0; ri < regionRows; ri++) {
+            for (var ci = 0; ci < regionCols; ci++) {
+                var r0 = ri * (regionDataRows + 2);
+                var c0 = ci * (regionDataCols + 2);
+                if (r0 + regionDataRows + 1 >= size || c0 + regionDataCols + 1 >= size) return null;
+                for (var dr = 0; dr < regionDataRows; dr++) {
+                    for (var dc = 0; dc < regionDataCols; dc++) {
+                        mapping[ri * regionDataRows + dr][ci * regionDataCols + dc] = !!cells[r0 + 1 + dr][c0 + 1 + dc];
+                    }
+                }
+            }
+        }
+        return mapping;
+    }
+
+    function dmReadCodewords(cells, symbol) {
+        var mapping = dmExtractMapping(cells, symbol);
+        if (!mapping) return null;
+        var placement = dmPlacementArray(symbol.mapping, symbol.mapping);
+        var total = symbol.data + symbol.ecc;
+        var codewords = new Array(total).fill(0);
+        for (var r = 0; r < symbol.mapping; r++) {
+            for (var c = 0; c < symbol.mapping; c++) {
+                var p = placement[r][c];
+                if (!p || p.charIdx >= total) continue;
+                if (mapping[r][c]) codewords[p.charIdx] |= (1 << (7 - p.bit));
+            }
+        }
+        return codewords;
+    }
+
+    function dmCorrectCodewords(finalCodewords, symbol) {
+        var dataCap = symbol.data;
+        var eccCap = symbol.ecc;
+        var blocks = symbol.blocks;
+        var eccPerBlock = eccCap / blocks;
+        if (blocks === 1) {
+            var corrected = dmRsDecode(finalCodewords.slice(0, dataCap + eccCap), eccPerBlock);
+            if (!corrected) return null;
+            return {
+                dataCodewords: corrected.slice(0, dataCap),
+                correctedCodewords: corrected.slice(0, dataCap + eccCap)
+            };
+        }
+
+        var dataBlocks = [];
+        var eccBlocks = [];
+        for (var b = 0; b < blocks; b++) {
+            var blockDataLen = 0;
+            for (var di = b; di < dataCap; di += blocks) blockDataLen++;
+            dataBlocks[b] = new Array(blockDataLen);
+            eccBlocks[b] = new Array(eccPerBlock);
+        }
+
+        var idx = 0;
+        var maxDataLen = Math.max.apply(null, dataBlocks.map(function(x) { return x.length; }));
+        for (var i = 0; i < maxDataLen; i++) {
+            for (var db = 0; db < blocks; db++) {
+                if (i < dataBlocks[db].length) dataBlocks[db][i] = finalCodewords[idx++];
+            }
+        }
+        for (var e = 0; e < eccPerBlock; e++) {
+            for (var eb = 0; eb < blocks; eb++) eccBlocks[eb][e] = finalCodewords[idx++];
+        }
+
+        var correctedBlocks = [];
+        for (var cb = 0; cb < blocks; cb++) {
+            var received = dataBlocks[cb].concat(eccBlocks[cb]);
+            var correctedBlock = dmRsDecode(received, eccPerBlock);
+            if (!correctedBlock) return null;
+            correctedBlocks[cb] = correctedBlock;
+        }
+
+        var dataCodewords = [];
+        var correctedCodewords = [];
+        for (var ii = 0; ii < maxDataLen; ii++) {
+            for (var rb = 0; rb < blocks; rb++) {
+                if (ii < dataBlocks[rb].length) {
+                    dataCodewords.push(correctedBlocks[rb][ii]);
+                    correctedCodewords.push(correctedBlocks[rb][ii]);
+                }
+            }
+        }
+        for (var ee = 0; ee < eccPerBlock; ee++) {
+            for (var re = 0; re < blocks; re++) correctedCodewords.push(correctedBlocks[re][dataBlocks[re].length + ee]);
+        }
+        return { dataCodewords: dataCodewords, correctedCodewords: correctedCodewords };
+    }
+
+    function b256Unpseudo(codeword, pos) {
+        var pr = (149 * pos) % 255 + 1;
+        var value = codeword - pr;
+        return value < 0 ? value + 256 : value;
+    }
+
+    function utf8Decode(bytes) {
+        try {
+            if (typeof TextDecoder !== "undefined") return new TextDecoder("utf-8").decode(new Uint8Array(bytes));
+        } catch (e) {}
+        var s = "";
+        for (var i = 0; i < bytes.length; i++) s += "%" + ("0" + bytes[i].toString(16)).slice(-2);
+        try { return decodeURIComponent(s); } catch (e2) { return bytes.map(function(b) { return String.fromCharCode(b); }).join(""); }
+    }
+
+    function readIntBytes(bytes, pos, count) {
+        if (pos + count > bytes.length) return null;
+        var v = 0;
+        for (var i = 0; i < count; i++) v = ((v << 8) | (bytes[pos + i] & 0xFF)) >>> 0;
+        return v >>> 0;
+    }
+
+    function dmDecodePayload(dataCodewords) {
+        var pos = 0;
+        var payloadBytes = [];
+        if (dataCodewords[pos] === 231) {
+            var len1 = b256Unpseudo(dataCodewords[pos + 1], pos + 2);
+            var dataLen, dataStart;
+            if (len1 <= 249) {
+                dataLen = len1;
+                dataStart = pos + 2;
+            } else {
+                var len2 = b256Unpseudo(dataCodewords[pos + 2], pos + 3);
+                dataLen = (len1 - 249) * 250 + len2;
+                dataStart = pos + 3;
+            }
+            if (dataLen < 0 || dataStart + dataLen > dataCodewords.length) return null;
+            for (var i = 0; i < dataLen; i++) {
+                payloadBytes.push(b256Unpseudo(dataCodewords[dataStart + i], dataStart + i + 1));
+            }
+            pos = dataStart + dataLen;
+        } else {
+            while (pos < dataCodewords.length && dataCodewords[pos] !== 129) {
+                var cw = dataCodewords[pos++];
+                if (cw >= 1 && cw <= 128) payloadBytes.push(cw - 1);
+                else if (cw === 235 && pos < dataCodewords.length) payloadBytes.push(128 + dataCodewords[pos++] - 1);
+                else return null;
+            }
+        }
+        if (dataCodewords[pos] !== 129) return null;
+        pos++;
+        if (pos + 4 > dataCodewords.length) return null;
+        var managementCode32 = readIntBytes(dataCodewords, pos, 4);
+        pos += 4;
+        var result = {
+            text: utf8Decode(payloadBytes),
+            bytes: payloadBytes.slice(0),
+            chunks: [],
+            managementCode: (managementCode32 >>> 16) & 0xFFFF,
+            managementCode32: managementCode32 >>> 0,
+            managementFlags16: managementCode32 & 0xFFFF
+        };
+        var flags = result.managementFlags16;
+        if ((flags & 0x0200) !== 0 && pos + 4 <= dataCodewords.length) { result.creationDateTimeExt32 = readIntBytes(dataCodewords, pos, 4); pos += 4; }
+        if ((flags & 0x0100) !== 0 && pos + 4 <= dataCodewords.length) { result.expiryExt32 = readIntBytes(dataCodewords, pos, 4); pos += 4; }
+        if ((flags & 0x0080) !== 0 && pos + 4 <= dataCodewords.length) { result.readerIdExt32 = readIntBytes(dataCodewords, pos, 4); pos += 4; }
+        if ((flags & 0x0040) !== 0 && pos + 4 <= dataCodewords.length) { result.managementExt32 = readIntBytes(dataCodewords, pos, 4); pos += 4; }
+        if ((flags & 0x0020) !== 0 && pos + 6 <= dataCodewords.length) {
+            result.locationLatExt24 = readIntBytes(dataCodewords, pos, 3); pos += 3;
+            result.locationLonExt24 = readIntBytes(dataCodewords, pos, 3); pos += 3;
+        }
+        if ((flags & 0x0010) !== 0 && pos + 3 <= dataCodewords.length) {
+            result.municipalityExt24 = readIntBytes(dataCodewords, pos, 3); pos += 3;
+        }
+        return result;
+    }
+
+    function dmDecodeCells(cells, options) {
+        if (!cells || !cells.length) return null;
+        var symbol = dmSymbolBySize(cells.length);
+        if (!symbol) return null;
+        var raw = dmReadCodewords(cells, symbol);
+        if (!raw) return null;
+        var codewords = raw.slice(0);
+        var mask = options && options.appEncMask;
+        if (mask && mask.length) {
+            for (var i = 0; i < codewords.length; i++) codewords[i] = codewords[i] ^ (mask[i % mask.length] & 0xFF);
+        }
+        var corrected = dmCorrectCodewords(codewords, symbol);
+        if (!corrected) return null;
+        var payload = dmDecodePayload(corrected.dataCodewords);
+        if (!payload) return null;
+        payload.codewords = corrected.correctedCodewords;
+        payload.dataBytes = corrected.dataCodewords;
+        payload.symbolSize = symbol.size;
+        payload.isDataMatrix = true;
+        return payload;
+    }
+
+    function lumaAt(data, width, height, x, y, radius) {
+        var x0 = Math.max(0, Math.floor(x - radius));
+        var y0 = Math.max(0, Math.floor(y - radius));
+        var x1 = Math.min(width - 1, Math.ceil(x + radius));
+        var y1 = Math.min(height - 1, Math.ceil(y + radius));
+        var sumR = 0, sumG = 0, sumB = 0, count = 0;
+        for (var yy = y0; yy <= y1; yy++) {
+            for (var xx = x0; xx <= x1; xx++) {
+                var idx = (yy * width + xx) * 4;
+                sumR += data[idx];
+                sumG += data[idx + 1];
+                sumB += data[idx + 2];
+                count++;
+            }
+        }
+        if (!count) return { luma: 255, chromaDark: 0 };
+        var r = sumR / count, g = sumG / count, b = sumB / count;
+        return {
+            luma: (r * 54 + g * 183 + b * 19) / 256,
+            chromaDark: 255 - Math.max(r, g, b)
+        };
+    }
+
+    function rotateDisplayToOriginal(display) {
+        var n = display.length;
+        var out = new Array(n);
+        for (var r = 0; r < n; r++) {
+            out[r] = new Array(n);
+            for (var c = 0; c < n; c++) out[r][c] = !!display[n - 1 - c][r];
+        }
+        return out;
+    }
+
+    function scoreDataMatrixFinder(cells) {
+        var n = cells.length;
+        var ok = 0, total = 0;
+        for (var i = 0; i < n; i++) {
+            total += 2;
+            if (cells[i][0]) ok++;
+            if (cells[n - 1][i]) ok++;
+            if (i > 0) {
+                total += 2;
+                if (cells[0][i] === (i % 2 === 0)) ok++;
+                if (cells[i][n - 1] === ((n - 1 - i) % 2 === 0)) ok++;
+            }
+        }
+        return total ? ok / total : 0;
+    }
+
+    function sampleQRMatrixDataMatrix(imageData, width, height, qrResult, dmSize) {
+        if (!qrResult || !qrResult.location || typeof qrResult.version !== "number") return null;
+        var loc = qrResult.location;
+        var tl = loc.topLeftCorner, tr = loc.topRightCorner, bl = loc.bottomLeftCorner;
+        if (!tl || !tr || !bl) return null;
+        var nqr = 17 + 4 * qrResult.version;
+        if (nqr <= 0 || dmSize > nqr) return null;
+        var stepX = { x: (tr.x - tl.x) / nqr, y: (tr.y - tl.y) / nqr };
+        var stepY = { x: (bl.x - tl.x) / nqr, y: (bl.y - tl.y) / nqr };
+        var moduleSize = (Math.hypot(stepX.x, stepX.y) + Math.hypot(stepY.x, stepY.y)) / 2;
+        var radius = Math.max(1, Math.round(moduleSize * 0.13));
+        var dmOrigin = nqr - dmSize + 1.5;
+        var display = new Array(dmSize);
+        var lumSamples = [];
+        for (var r = 0; r < dmSize; r++) {
+            display[r] = new Array(dmSize);
+            for (var c = 0; c < dmSize; c++) {
+                var qx = dmOrigin + c + 0.5;
+                var qy = dmOrigin + r + 0.5;
+                var px = tl.x + qx * stepX.x + qy * stepY.x;
+                var py = tl.y + qx * stepX.y + qy * stepY.y;
+                if (px < 0 || py < 0 || px >= width || py >= height) {
+                    display[r][c] = false;
+                    lumSamples.push(255);
+                    continue;
+                }
+                var sample = lumaAt(imageData, width, height, px, py, radius);
+                lumSamples.push(sample.luma);
+                display[r][c] = sample.luma < 190 || sample.chromaDark > 18;
+            }
+        }
+        var sorted = lumSamples.slice(0).sort(function(a, b) { return a - b; });
+        var low = sorted[Math.floor(sorted.length * 0.18)] || 0;
+        var high = sorted[Math.floor(sorted.length * 0.82)] || 255;
+        var threshold = Math.max(40, Math.min(225, (low + high) / 2));
+        if (high - low > 20) {
+            for (var rr = 0, k = 0; rr < dmSize; rr++) {
+                for (var cc = 0; cc < dmSize; cc++, k++) display[rr][cc] = lumSamples[k] <= threshold;
+            }
+        }
+        return rotateDisplayToOriginal(display);
+    }
+
+    api.decodeDataMatrixCells = function(cells, options) {
+        try { return dmDecodeCells(cells, options || {}); } catch (e) { return null; }
+    };
+
+    api.decodeQRMatrix = function(imageData, width, height, qrResult, options) {
+        options = options || {};
+        var data = imageData && imageData.data ? imageData.data : imageData;
+        if (!data || !qrResult || typeof qrResult.version !== "number") return null;
+        var nqr = 17 + 4 * qrResult.version;
+        var candidates = [];
+        for (var i = 0; i < DM_SYMBOLS.length; i++) {
+            if (DM_SYMBOLS[i].size <= nqr - 8) candidates.push(DM_SYMBOLS[i].size);
+        }
+        candidates.sort(function(a, b) { return b - a; });
+        var bestFinder = 0;
+        for (var c = 0; c < candidates.length; c++) {
+            var cells = sampleQRMatrixDataMatrix(data, width, height, qrResult, candidates[c]);
+            if (!cells) continue;
+            var finderScore = scoreDataMatrixFinder(cells);
+            if (finderScore > bestFinder) bestFinder = finderScore;
+            if (finderScore < 0.62) continue;
+            var decoded = dmDecodeCells(cells, options);
+            if (decoded) {
+                decoded.cells = cells;
+                decoded.finderScore = finderScore;
+                return decoded;
+            }
+        }
+        return { isRaw: true, finderScore: bestFinder };
+    };
+})(typeof self !== "undefined" ? self : this);
+
+

@@ -46,6 +46,7 @@
         
         .mode-btns { display: flex; flex-direction: column; gap: 10px; align-items: center; }
         .mode-btns .btn { width: 80%; max-width: 300px; }
+        .mode-title { font-size: 0.85rem; color: #aaa; margin: 4px 0; }
         
         /* 画面オーバーレイ (パスワード・結果画面) */
         .overlay-screen { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 100; display: none; flex-direction: column; justify-content: center; align-items: center; padding: 20px; box-sizing: border-box; text-align: center; }
@@ -84,14 +85,25 @@
     <div class="result-panel">
         <div class="status" id="statusText">モードを選択してください</div>
         <div id="btnContainer">
-            <div class="mode-btns">
+            <div class="mode-btns" id="productSelectBtns">
+                <button class="btn" id="qrTwinSelectBtn">QRツイン</button>
+                <button class="btn" id="qrMatrixSelectBtn" style="background-color:#00695C;">QRマトリックス</button>
+                <button class="btn secondary" id="logoutBtn" style="margin-top:10px; font-size:0.9rem;">端末情報を変更</button>
+            </div>
+            <div class="mode-btns" id="qrTwinModeBtns" style="display:none;">
+                <div class="mode-title">QRツイン</div>
                 <button class="btn" id="normalModeBtn">通常モード</button>
                 <button class="btn sys-enc" id="digitalSignModeBtn">電子署名モード</button>
                 <button class="btn double-enc" id="doubleEncModeBtn">二重暗号化モード</button>
                 <button class="btn" id="colorEncModeBtn" style="background-color:#00897B; display:none;">カラー符号化モード</button>
                 <button class="btn" id="newColorEncModeBtn" style="background-color:#6A1B9A;">新カラー符号化モード</button>
-                <button class="btn" id="qrMatrixModeBtn" style="background-color:#D84315;">QRマトリックスモード</button>
-                <button class="btn secondary" id="logoutBtn" style="margin-top:10px; font-size:0.9rem;">端末情報を変更</button>
+                <button class="btn secondary" id="backToProductBtn">戻る</button>
+            </div>
+            <div class="mode-btns" id="qrMatrixModeBtns" style="display:none;">
+                <div class="mode-title">QRマトリックス</div>
+                <button class="btn" id="matrixNormalModeBtn" style="background-color:#00897B;">通常モード</button>
+                <button class="btn sys-enc" id="matrixDigitalSignModeBtn">電子署名モード</button>
+                <button class="btn secondary" id="matrixBackToProductBtn">戻る</button>
             </div>
         </div>
     </div>
@@ -171,10 +183,6 @@
                 <div class="qr-data-card" style="border-color: #29B6F6; margin-top:12px;">
                     <label id="normalResultLabel2" style="color:#29B6F6;">第2QR</label>
                     <div class="text" id="resText2">-</div>
-                </div>
-                <div id="normalCreationDateCard" class="qr-data-card" style="border-color: #81C784; margin-top:12px; display:none;">
-                    <label style="color:#81C784;">作成日時</label>
-                    <div class="text" id="normalCreationDateTime">-</div>
                 </div>
             </div>
             <!-- 電子署名モード表示 -->
@@ -292,7 +300,6 @@
     </div>
 
     <script src="jsQR.js"></script>
-    <script src="dm-decoder.js"></script>
 
     <script>
         if ('serviceWorker' in navigator) {
@@ -330,11 +337,6 @@
         let sysEncStage3 = false; // 通常モードでシステム暗号化の第2QR探索中フラグ
         let digitalSignStage3 = false; // 電子署名モードの第2QR（もしくはペア）探索中フラグ
         let lastTwinBBox = null; // ★ Stage 1で検出したツインQRの領域を保存
-
-        // ★ QRマトリックスモード専用状態
-        let qrMatrixLastFail = 0;
-        let qrMatrixDMData = null;   // DM 側から復号したデータ・管理情報
-        let qrMatrixQRData = null;   // QR 側から復号したデータ・管理情報
 
         // ★ 端末情報登録システム
         let currentTerminalHashes = [];
@@ -553,8 +555,9 @@
         const TRI_LIGHT_PRIORITY = ['green', 'cyan', 'yellow'];
         const QUAD_COLOR_NAMES = ['black', 'blue', 'red', 'purple', 'yellow', 'cyan', 'green', 'white'];
 
-        // モード: 'normal', 'double', 'digital_sign', 'color_enc', 'new_color_enc'
+        // モード: 'normal', 'double', 'digital_sign', 'color_enc', 'new_color_enc', 'matrix_normal', 'matrix_digital_sign'
         let scanMode = 'normal';
+        let readerFamily = null; // 'twin' or 'matrix'
         let newColorScanStage = 0; // 0=Q1探索中, 1=Q1検出済み(色QR探索中)
         let newColorQ1Data = null; // 第1QRの読取結果
         let newColorScanResult = null;
@@ -820,7 +823,11 @@
                 isScanning = true;
                 startWatchingPosition();
 
-                if (scanMode === 'normal') {
+                if (scanMode === 'matrix_normal') {
+                    statusText.innerText = "QRマトリックスを探索中...";
+                } else if (scanMode === 'matrix_digital_sign') {
+                    statusText.innerText = "電子署名QRマトリックスを探索中...";
+                } else if (scanMode === 'normal') {
                     statusText.innerText = "第1QRを探索中... (Hybrid)";
                 } else if (scanMode === 'new_color_enc') {
                     statusText.innerText = "カラーQRツインの第1QRを探索中...";
@@ -839,20 +846,55 @@
             doLogout();
         });
 
+        function showProductSelect() {
+            readerFamily = null;
+            document.getElementById('productSelectBtns').style.display = '';
+            document.getElementById('qrTwinModeBtns').style.display = 'none';
+            document.getElementById('qrMatrixModeBtns').style.display = 'none';
+            statusText.innerText = "モードを選択してください";
+            document.getElementById('headerText').innerText = 'QR Twin Reader';
+        }
+
+        function showQrTwinModes() {
+            readerFamily = 'twin';
+            document.getElementById('productSelectBtns').style.display = 'none';
+            document.getElementById('qrTwinModeBtns').style.display = '';
+            document.getElementById('qrMatrixModeBtns').style.display = 'none';
+            statusText.innerText = "QRツインのモードを選択してください";
+            document.getElementById('headerText').innerText = 'QR Twin Reader';
+        }
+
+        function showQrMatrixModes() {
+            readerFamily = 'matrix';
+            document.getElementById('productSelectBtns').style.display = 'none';
+            document.getElementById('qrTwinModeBtns').style.display = 'none';
+            document.getElementById('qrMatrixModeBtns').style.display = '';
+            statusText.innerText = "QRマトリックスのモードを選択してください";
+            document.getElementById('headerText').innerText = 'QR Matrix Reader';
+        }
+
+        document.getElementById('qrTwinSelectBtn').addEventListener('click', showQrTwinModes);
+        document.getElementById('qrMatrixSelectBtn').addEventListener('click', showQrMatrixModes);
+        document.getElementById('backToProductBtn').addEventListener('click', showProductSelect);
+        document.getElementById('matrixBackToProductBtn').addEventListener('click', showProductSelect);
+
         // モード選択ボタン
         document.getElementById('normalModeBtn').addEventListener('click', () => {
+            readerFamily = 'twin';
             scanMode = 'normal';
             document.getElementById('headerText').innerText = 'QR Twin Reader (通常モード)';
             startCamera();
         });
 
         document.getElementById('doubleEncModeBtn').addEventListener('click', () => {
+            readerFamily = 'twin';
             scanMode = 'double';
             document.getElementById('headerText').innerText = 'QR Twin Reader (二重暗号化モード)';
             startCamera();
         });
 
         document.getElementById('digitalSignModeBtn').addEventListener('click', () => {
+            readerFamily = 'twin';
             scanMode = 'digital_sign';
             document.getElementById('headerText').innerText = 'QR Twin Reader (電子署名対応)';
             startScanByDigitalSign();
@@ -860,6 +902,7 @@
 
         // ★ 新カラー符号化モード
         document.getElementById('newColorEncModeBtn').addEventListener('click', () => {
+            readerFamily = 'twin';
             scanMode = 'new_color_enc';
             appMask = null;
             resetNewColorScanState();
@@ -867,12 +910,19 @@
             startCamera();
         });
 
-        // ★ QRマトリックスモード (QR + Data Matrix 重層)
-        document.getElementById('qrMatrixModeBtn').addEventListener('click', () => {
-            scanMode = 'qr_matrix';
+        document.getElementById('matrixNormalModeBtn').addEventListener('click', () => {
+            readerFamily = 'matrix';
+            scanMode = 'matrix_normal';
             appMask = null;
-            qrMatrixLastFail = 0;
-            document.getElementById('headerText').innerText = 'QR Matrix Reader (QRマトリックス)';
+            document.getElementById('headerText').innerText = 'QR Matrix Reader (通常モード)';
+            startCamera();
+        });
+
+        document.getElementById('matrixDigitalSignModeBtn').addEventListener('click', () => {
+            readerFamily = 'matrix';
+            scanMode = 'matrix_digital_sign';
+            appMask = null;
+            document.getElementById('headerText').innerText = 'QR Matrix Reader (電子署名対応)';
             startCamera();
         });
 
@@ -946,11 +996,24 @@
             const creationDateTimeSource = scanMode === 'new_color_enc'
                 ? (newColorQ1Data && newColorQ1Data.creationDateTimeExt32 != null ? newColorQ1Data.creationDateTimeExt32 : null)
                 : (firstQR && firstQR.creationDateTimeExt32 != null ? firstQR.creationDateTimeExt32 : null);
+            let manualCreationDateTime = null;
+            if (scanMode === 'matrix_normal' && creationDateTimeSource == null) {
+                const dtText = window.prompt("作成日時を暗号鍵に含めたQRマトリックスの場合は、作成日時を入力してください。\n例: 2026/04/21 13:05:09\n不明または未使用の場合は空欄のままOKです。", "");
+                if (dtText && dtText.trim()) {
+                    manualCreationDateTime = parseCreationDateTimeInputToExt32(dtText.trim());
+                    if (manualCreationDateTime == null) {
+                        alert("作成日時の形式を確認してください。例: 2026/04/21 13:05:09");
+                        document.getElementById('passwordScreen').style.display = 'flex';
+                        return;
+                    }
+                }
+            }
+            const maskDateTimeSource = creationDateTimeSource != null ? creationDateTimeSource : manualCreationDateTime;
 
             // 作成日時32ビットがある場合は「パスワード+作成日時4バイト」でマスク生成
-            if (creationDateTimeSource != null) {
+            if (maskDateTimeSource != null) {
                 const pwBytes = new TextEncoder().encode(pw);
-                const dt = creationDateTimeSource;
+                const dt = maskDateTimeSource;
                 const dtBytes = new Uint8Array(4);
                 dtBytes[0] = (dt >>> 24) & 0xFF;
                 dtBytes[1] = (dt >>> 16) & 0xFF;
@@ -976,13 +1039,12 @@
                 return;
             }
 
-            if (scanMode === 'qr_matrix') {
-                scanStage = 3;
-                if (firstQR) firstQR.points = null;
-                statusText.innerText = "QRマトリックスを再探索中... (復号)";
+            if (scanMode === 'matrix_normal') {
+                scanStage = 1;
+                statusText.innerText = "QRマトリックス（ユーザ暗号化）を復号中...";
                 isScanning = true;
                 lastDetectTime = Date.now();
-                requestAnimationFrame(scanLoopQRMatrix);
+                requestAnimationFrame(scanLoop);
                 return;
             }
 
@@ -1084,6 +1146,26 @@
                 return;
             }
             el.textContent = value;
+        }
+
+        function parseCreationDateTimeInputToExt32(text) {
+            const m = String(text || '').trim().match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+            if (!m) return null;
+            const year = parseInt(m[1], 10);
+            const month = parseInt(m[2], 10);
+            const day = parseInt(m[3], 10);
+            const hour = parseInt(m[4] || '0', 10);
+            const minute = parseInt(m[5] || '0', 10);
+            const second = parseInt(m[6] || '0', 10);
+            if (year < 2026 || year > 2041) return null;
+            if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return null;
+            return ((((year - 2026) & 0xF) << 28)
+                | ((month & 0xF) << 24)
+                | ((day & 0x1F) << 19)
+                | ((hour & 0x1F) << 14)
+                | ((minute & 0x3F) << 8)
+                | ((second & 0x3F) << 2)) >>> 0;
         }
 
         function formatCreationDateTimeExt32(value) {
@@ -1195,6 +1277,10 @@
                     resultTitle.innerText = 'ファイルのパスワードFは以下です';
                     if (label1El) label1El.innerText = 'パスワードA';
                     if (label2El) label2El.innerText = 'パスワードF';
+                } else if (scanMode === 'matrix_normal') {
+                    resultTitle.innerText = 'QRマトリックス読取結果';
+                    if (label1El) label1El.innerText = 'データマトリックス';
+                    if (label2El) label2El.innerText = 'QRコード';
                 } else {
                     // 通常モード / その他
                     resultTitle.innerText = '読取結果';
@@ -1225,18 +1311,13 @@
             digitalSignStage3 = false;
             lastTwinBBox = null;
             resetNewColorScanState();
-            // QRマトリックスモード状態リセット
-            qrMatrixLastFail = 0;
-            qrMatrixDMData = null;
-            qrMatrixQRData = null;
             
             // モード選択画面に戻す
             scanStage = 0;
             isScanning = false;
             document.getElementById('cameraControls').style.display = 'none';
             document.getElementById('btnContainer').style.display = '';
-            statusText.innerText = "モードを選択してください";
-            document.getElementById('headerText').innerText = 'QR Twin Reader';
+            showProductSelect();
         }
 
         function restartScan() {
@@ -1269,6 +1350,13 @@
                 digitalSignStage3 = false;
                 scanStage = 1;
                 statusText.innerText = "電子署名モード: 第1QRを探索中...";
+            } else if (scanMode === 'matrix_digital_sign') {
+                digitalSignStage3 = false;
+                scanStage = 1;
+                statusText.innerText = "電子署名QRマトリックスを探索中...";
+            } else if (scanMode === 'matrix_normal') {
+                scanStage = 1;
+                statusText.innerText = "QRマトリックスを探索中...";
             } else if (scanMode === 'color_enc') {
                 scanStage = 1;
                 statusText.innerText = "Scanning Color QR Twin...";
@@ -1279,12 +1367,6 @@
             } else if (scanMode === 'normal') {
                 scanStage = 1;
                 statusText.innerText = "Scanning QR1... (Hybrid)";
-            } else if (scanMode === 'qr_matrix') {
-                scanStage = 1;
-                qrMatrixLastFail = 0;
-                qrMatrixDMData = null;
-                qrMatrixQRData = null;
-                statusText.innerText = "QRマトリックス探索中...";
             } else {
                 scanStage = 1;
                 statusText.innerText = "Scanning encrypted QR1...";
@@ -3175,6 +3257,250 @@
             };
         }
 
+        function isQrMatrixMode() {
+            return scanMode === 'matrix_normal' || scanMode === 'matrix_digital_sign';
+        }
+
+        function qrResultToMatrixItem(qr) {
+            if (!qr) return null;
+            const loc = qr.location;
+            const points = loc ? [
+                loc.topLeftCorner,
+                loc.topRightCorner,
+                loc.bottomRightCorner,
+                loc.bottomLeftCorner
+            ].filter(Boolean) : null;
+            return {
+                text: qr.data || '',
+                managementCode: qr.managementCode,
+                managementCode32: qr.managementCode32,
+                managementFlags16: qr.managementFlags16,
+                managementExt32: qr.managementExt32,
+                expiryExt32: qr.expiryExt32,
+                readerIdExt32: qr.readerIdExt32,
+                creationDateTimeExt32: qr.creationDateTimeExt32,
+                locationLatExt24: qr.locationLatExt24,
+                locationLonExt24: qr.locationLonExt24,
+                municipalityExt24: qr.municipalityExt24,
+                points,
+                codewords: qr.codewords,
+                dataBytes: qr.dataBytes,
+                version: qr.version,
+                raw: !!qr.isRaw
+            };
+        }
+
+        function dmResultToMatrixItem(dm, anchorQr = null) {
+            if (!dm) return null;
+            const anchor = anchorQr && anchorQr.location ? [
+                anchorQr.location.topLeftCorner,
+                anchorQr.location.topRightCorner,
+                anchorQr.location.bottomRightCorner,
+                anchorQr.location.bottomLeftCorner
+            ].filter(Boolean) : null;
+            return {
+                text: dm.text || '',
+                managementCode: dm.managementCode,
+                managementCode32: dm.managementCode32,
+                managementFlags16: dm.managementFlags16,
+                managementExt32: dm.managementExt32,
+                expiryExt32: dm.expiryExt32,
+                readerIdExt32: dm.readerIdExt32,
+                creationDateTimeExt32: dm.creationDateTimeExt32,
+                locationLatExt24: dm.locationLatExt24,
+                locationLonExt24: dm.locationLonExt24,
+                municipalityExt24: dm.municipalityExt24,
+                points: anchor,
+                codewords: dm.codewords,
+                dataBytes: dm.dataBytes,
+                symbolSize: dm.symbolSize,
+                isDataMatrix: true
+            };
+        }
+
+        function appendQrMatrixCandidates(target, qrList, seen) {
+            if (!qrList) return;
+            const arr = Array.isArray(qrList) ? qrList : [qrList];
+            for (const qr of arr) {
+                if (!qr || !qr.location || typeof qr.version !== 'number') continue;
+                const tl = qr.location.topLeftCorner || { x: 0, y: 0 };
+                const key = [
+                    Math.round(tl.x / 6),
+                    Math.round(tl.y / 6),
+                    qr.version,
+                    qr.isRaw ? 'raw' : (qr.managementCode32 || qr.data || '')
+                ].join(':');
+                if (seen.has(key)) continue;
+                seen.add(key);
+                target.push(qr);
+            }
+        }
+
+        function collectQrMatrixCandidates(imageData, width, height, needSysDecode) {
+            const candidates = [];
+            const seen = new Set();
+            const base = { inversionAttempts: 'attemptBoth', multi: true, extractRawForFailed: true };
+            appendQrMatrixCandidates(candidates, jsQR(imageData.data, width, height, base), seen);
+            appendQrMatrixCandidates(candidates, jsQR(imageData.data, width, height, { ...base, sysEncDecode: true }), seen);
+            if (appMask) {
+                appendQrMatrixCandidates(candidates, jsQR(imageData.data, width, height, {
+                    inversionAttempts: 'attemptBoth',
+                    multi: true,
+                    appEncMask: Array.from(appMask),
+                    extractRawForFailed: true
+                }), seen);
+            } else if (needSysDecode) {
+                appendQrMatrixCandidates(candidates, jsQR(imageData.data, width, height, { ...base, sysEncDecode: true }), seen);
+            }
+            candidates.sort((a, b) => {
+                const ar = a.isRaw ? 1 : 0;
+                const br = b.isRaw ? 1 : 0;
+                return ar - br;
+            });
+            return candidates;
+        }
+
+        async function validateMatrixFirstData(dmItem) {
+            if (!dmItem) return null;
+            if (dmItem.expiryExt32 !== undefined && !checkExpiry(dmItem.expiryExt32)) {
+                return "読み取りの有効期間が終了しました";
+            }
+            if (dmItem.readerIdExt32 !== undefined && !matchesRegisteredTerminalId(dmItem.readerIdExt32)) {
+                return "読取端末IDが一致しません";
+            }
+            if (dmItem.locationLatExt24 !== undefined && dmItem.locationLonExt24 !== undefined) {
+                const locMatch = await checkLocation(dmItem.locationLatExt24, dmItem.locationLonExt24);
+                if (!locMatch) return "読取位置が一致しません";
+            }
+            if (dmItem.municipalityExt24 !== undefined) {
+                const muniMatch = await checkMunicipality(dmItem.municipalityExt24);
+                if (!muniMatch) return "市町村コードが一致しません";
+            }
+            return null;
+        }
+
+        function verifyMatrixSignature(signatureText) {
+            const hasImageDataId = firstQR && firstQR.managementExt32 !== undefined && firstQR.managementExt32 !== null;
+            const imageDataId = hasImageDataId ? firstQR.managementExt32 : 0;
+            if (!signatureText || !firstQR || !firstQR.codewords) {
+                return { verified: false, senderName: '署名データなし', imageDataId, hasImageDataId };
+            }
+            try {
+                const binaryStr = atob(signatureText);
+                if (binaryStr.length !== 42) throw new Error('Invalid signature length');
+                const signBytes = new Uint8Array(42);
+                for (let i = 0; i < 42; i++) signBytes[i] = binaryStr.charCodeAt(i);
+                const keyId = (signBytes[0] << 8) | signBytes[1];
+                const sigR = signBytes.slice(2, 22);
+                const sigS = signBytes.slice(22, 42);
+                const pubKeyHex = ECDSA_PUBLIC_KEYS[keyId];
+                const senderName = ECDSA_SENDER_NAMES[keyId] || `ID:${keyId}`;
+                const hashInput = new Uint8Array(firstQR.codewords);
+                const verified = !!(pubKeyHex && ecdsaVerify(hashInput, sigR, sigS, pubKeyHex));
+                return { verified, senderName, keyId, imageDataId, hasImageDataId };
+            } catch (err) {
+                return { verified: false, senderName: '署名解析エラー', imageDataId, hasImageDataId };
+            }
+        }
+
+        async function processQrMatrixFrame(imageData, width, height) {
+            const needSysDecode = scanMode === 'matrix_digital_sign' || (scanMode === 'matrix_normal' && scanStage === 3 && sysEncStage3);
+            const qrCandidates = collectQrMatrixCandidates(imageData, width, height, needSysDecode);
+            let sawRawMatrix = false;
+            let bestFinderScore = 0;
+
+            for (const qr of qrCandidates) {
+                const qrMgmtInfo = parseStandardMgmt(qr.managementCode32 !== undefined && qr.managementCode32 !== null
+                    ? qr.managementCode32
+                    : getManagementCode32FromParts(qr.managementCode, qr.managementFlags16));
+                const qrNo = qrMgmtInfo ? qrMgmtInfo.qrNo : null;
+                if (qrNo !== null && qrNo !== 1 && !qr.isRaw) continue;
+
+                let dm = jsQR.decodeQRMatrix(imageData.data, width, height, qr, appMask ? { appEncMask: Array.from(appMask) } : {});
+                if (appMask && (!dm || dm.isRaw)) {
+                    // 生成仕様の差異に備え、DM側が平文でQR側だけ暗号化されているケースも拾う。
+                    dm = jsQR.decodeQRMatrix(imageData.data, width, height, qr, {});
+                }
+                if (dm && dm.finderScore) bestFinderScore = Math.max(bestFinderScore, dm.finderScore);
+                if (!dm || dm.isRaw) {
+                    if (qr.isRaw || (dm && dm.finderScore && dm.finderScore > 0.72)) sawRawMatrix = true;
+                    continue;
+                }
+
+                const dmMgmtInfo = parseStandardMgmt(dm.managementCode, dm.managementFlags16);
+                if (!dmMgmtInfo || dmMgmtInfo.qrNo !== 0) continue;
+
+                const dmItem = dmResultToMatrixItem(dm, qr);
+                const accessError = await validateMatrixFirstData(dmItem);
+                if (accessError) {
+                    isScanning = false;
+                    isProcessing = false;
+                    showResultScreen(null, accessError);
+                    return true;
+                }
+
+                if (scanMode === 'matrix_digital_sign') {
+                    if (!qr.data || qr.isRaw) continue;
+                    firstQR = dmItem;
+                    secondQR = qrResultToMatrixItem(qr);
+                    if (dmItem.points && dmItem.points.length === 4) drawBoundingBox(dmItem.points, '#00E676');
+                    const signatureResult = verifyMatrixSignature(secondQR.text);
+                    isScanning = false;
+                    isProcessing = false;
+                    statusText.innerText = "電子署名を検証しました";
+                    showResultScreen(signatureResult);
+                    return true;
+                }
+
+                if (scanStage === 1) {
+                    firstQR = dmItem;
+                    if (dmItem.points && dmItem.points.length === 4) drawBoundingBox(dmItem.points, '#00E676');
+
+                    if (dmMgmtInfo.appEncFlag && !appMask) {
+                        isProcessing = false;
+                        showPasswordScreen(dmItem.text, 'データマトリックスを読取済み。QRコード復号用のパスワード入力待ちです。');
+                        return true;
+                    }
+                    if (dmMgmtInfo.sysEncFlag && !sysEncStage3) {
+                        isProcessing = false;
+                        showSysEncScreen();
+                        return true;
+                    }
+                    if (!qr.data || qr.isRaw) {
+                        scanStage = 3;
+                        statusText.innerText = "QRコードを探索中...";
+                        return true;
+                    }
+                    secondQR = qrResultToMatrixItem(qr);
+                    isScanning = false;
+                    isProcessing = false;
+                    showResultScreen();
+                    return true;
+                }
+
+                if (scanStage === 3) {
+                    if (!firstQR) firstQR = dmItem;
+                    if (!qr.data || qr.isRaw) continue;
+                    secondQR = qrResultToMatrixItem(qr);
+                    isScanning = false;
+                    isProcessing = false;
+                    showResultScreen();
+                    return true;
+                }
+            }
+
+            if (scanMode === 'matrix_normal' && scanStage === 1 && !appMask && sawRawMatrix && bestFinderScore > 0.72) {
+                isProcessing = false;
+                showPasswordScreen('暗号化されたQRマトリックス', 'QRマトリックスは暗号化されている可能性があります。パスワードを入力してください。');
+                return true;
+            }
+
+            statusText.innerText = scanMode === 'matrix_digital_sign'
+                ? "電子署名QRマトリックスを解析中..."
+                : "QRマトリックスを解析中...";
+            return false;
+        }
+
         function newColorModeNeedsPassword(mgmtInfo) {
             return !!(mgmtInfo && (mgmtInfo.dataCompBits === 2 || mgmtInfo.dataCompBits === 3));
         }
@@ -3335,12 +3661,6 @@
         async function scanLoop() {
             if (!isScanning) return;
 
-            // ★ QRマトリックスモードは専用ループで処理
-            if (scanMode === 'qr_matrix') {
-                await scanLoopQRMatrix();
-                return;
-            }
-
             if (video.videoWidth && overlayCanvas.width !== video.videoWidth) {
                 overlayCanvas.width = video.videoWidth;
                 overlayCanvas.height = video.videoHeight;
@@ -3358,6 +3678,20 @@
                 lastDetectTime = now;
 
                 try {
+                    // === QRマトリックスモード ===
+                    if (isQrMatrixMode()) {
+                        const vw = video.videoWidth;
+                        const vh = video.videoHeight;
+                        zxingCanvas.width = vw;
+                        zxingCanvas.height = vh;
+                        zxingCtx.drawImage(video, 0, 0, vw, vh);
+                        const fullData = zxingCtx.getImageData(0, 0, vw, vh);
+                        const handled = await processQrMatrixFrame(fullData, vw, vh);
+                        isProcessing = false;
+                        if (!handled && isScanning) requestAnimationFrame(scanLoop);
+                        return;
+                    }
+
                     // === 新カラー符号化モード ===
                     if (scanMode === 'new_color_enc') {
                         // 新カラー符号化モード: 第1QR（白黒、ツインの表面）を通常読取りし、
@@ -4168,265 +4502,6 @@
             }
 
             if (isScanning) requestAnimationFrame(scanLoop);
-        }
-
-        // ================================================================
-        // ===== QRマトリックスモード (QR + Data Matrix 重層) =====
-        // ================================================================
-        //
-        // QR Matrix Generator.html / dm.js で生成される QR+DM 複合シンボルを
-        // 読み取る。生成仕様:
-        //   - DM は 90度 CCW 回転して QR の右下角に重ねる (0.5 セル offset)
-        //   - DM の L字ファインダー右下が QR の右下外側 +1.5 セル
-        //   - QR 側タイミング列と重なる 2 行/列は消去 (DM タイミング優先)
-        //   - DM データコード語列は (1)通常データ (2)129 (3)管理32bit
-        //     (4)拡張管理部 (5)129 (6)埋め草
-        //   - ユーザ暗号化時は DM / QR 両方に XOR マスク適用 (マスクは共通ルール)
-        //   - 電子署名モードでは QR の payload が base64 署名, DM が被署名内容
-        //
-        // 復号手順:
-        //   1) jsQR で QR を検出 (dontInvert / attemptBoth / inversion)
-        //   2) QR の codewords・管理ビットを取得 (jsQR 拡張 API)
-        //   3) dmdecode.decodeFromImage() で DM 側を復号
-        //   4) 管理ビットから encryption 種別を判定し必要ならパスワード画面
-        //   5) 電子署名検証 or 通常表示で結果画面へ
-
-        async function scanLoopQRMatrix() {
-            if (!isScanning) return;
-
-            if (video.videoWidth && overlayCanvas.width !== video.videoWidth) {
-                overlayCanvas.width = video.videoWidth;
-                overlayCanvas.height = video.videoHeight;
-            }
-            ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-            if (firstQR && firstQR.points) drawBoundingBox(firstQR.points, '#FF6F00');
-
-            const now = Date.now();
-            if (!isProcessing && now - lastDetectTime > SCAN_INTERVAL_MS && video.readyState >= 2) {
-                isProcessing = true;
-                lastDetectTime = now;
-                try {
-                    const vw = video.videoWidth, vh = video.videoHeight;
-                    zxingCanvas.width = vw;
-                    zxingCanvas.height = vh;
-                    zxingCtx.drawImage(video, 0, 0, vw, vh);
-                    const frame = zxingCtx.getImageData(0, 0, vw, vh);
-
-                    // --- (1) QR 検出 (sysEnc 自動判定) ---
-                    let qrRes = null;
-                    for (const sysEncDecode of [false, true]) {
-                        const opts = {
-                            inversionAttempts: 'attemptBoth',
-                            sysEncDecode
-                        };
-                        if (appMask) opts.appEncMask = appMask;
-                        const r = jsQR(frame.data, vw, vh, opts);
-                        if (r && r.location) {
-                            qrRes = r;
-                            qrRes._sysEncUsed = sysEncDecode;
-                            break;
-                        }
-                    }
-
-                    if (!qrRes) {
-                        qrMatrixLastFail++;
-                        if (qrMatrixLastFail % 30 === 0) {
-                            statusText.innerText = 'QRマトリックスを探索中... (QR未検出)';
-                        }
-                        isProcessing = false;
-                        if (isScanning) requestAnimationFrame(scanLoop);
-                        return;
-                    }
-
-                    // --- (2) DM 復号 ---
-                    const NQR = qrRes.dimension || (qrRes.version ? (17 + 4 * qrRes.version) : null);
-                    if (!NQR) {
-                        throw new Error('QR dimension 取得失敗');
-                    }
-                    let dmRes = null;
-                    try {
-                        const dmOpts = {};
-                        if (appMask) dmOpts.xorMask = appMask;
-                        dmRes = window.dmdecode.decodeFromImage(frame, qrRes.location, NQR, dmOpts);
-                    } catch (e) {
-                        console.warn('DM 復号失敗:', e.message);
-                    }
-
-                    if (!dmRes || dmRes.detectScore < 0.5) {
-                        qrMatrixLastFail++;
-                        if (qrMatrixLastFail % 10 === 0) {
-                            statusText.innerText = 'QRマトリックス: DM 探索中... (QRのみ検出)';
-                        }
-                        // QR は読めたが DM が見つからない → 通常 QR として扱う選択肢もあり。
-                        // ここでは DM 必須のモードなので継続して撮影させる。
-                        isProcessing = false;
-                        if (isScanning) requestAnimationFrame(scanLoop);
-                        return;
-                    }
-
-                    qrMatrixLastFail = 0;
-
-                    // --- (3) 暗号化判定 ---
-                    const dmMgmt = dmRes.managementCode32 || 0;
-                    const dmMgmtInfo = parseStandardMgmt(dmMgmt);
-                    const appEncBit = dmMgmtInfo ? dmMgmtInfo.appEncFlag : false;
-                    const sysEncUsed = qrRes._sysEncUsed;
-                    const isDigitalSign = looksLikeDigitalSignBase64(qrRes.data);
-
-                    // --- (4) ユーザ暗号化: パスワード入力 ---
-                    if (appEncBit && !appMask) {
-                        isScanning = false;
-                        firstQR = {
-                            text: qrRes.data,
-                            codewords: qrRes.codewords,
-                            managementCode: qrRes.managementCode,
-                            managementCode32: qrRes.managementCode32,
-                            creationDateTimeExt32: dmRes.creationDateTimeExt32
-                        };
-                        qrMatrixDMData = dmRes;
-                        qrMatrixQRData = qrRes;
-                        showPasswordScreen(dmRes.data || qrRes.data || '-',
-                            'QRマトリックスはユーザ暗号化されています。パスワード入力待ちです。');
-                        isProcessing = false;
-                        return;
-                    }
-
-                    // --- (4.5) 環境制約チェック ---
-                    if (!checkExpiry(dmRes.expiryExt32)) {
-                        showResultScreen(null, '読取期限が切れています');
-                        isProcessing = false;
-                        return;
-                    }
-                    if (!matchesRegisteredTerminalId(dmRes.readerIdExt32)) {
-                        showResultScreen(null, '読取者IDが一致しません');
-                        isProcessing = false;
-                        return;
-                    }
-                    if (dmRes.locationLatExt24 !== null && dmRes.locationLonExt24 !== null) {
-                        const locMatch = await checkLocation(dmRes.locationLatExt24, dmRes.locationLonExt24);
-                        if (!locMatch) {
-                            showResultScreen(null, '指定された読取場所と一致しません');
-                            isProcessing = false;
-                            return;
-                        }
-                    }
-                    if (dmRes.municipalityExt24 !== null) {
-                        const muniMatch = await checkMunicipality(dmRes.municipalityExt24);
-                        if (!muniMatch) {
-                            showResultScreen(null, '指定された市町村と一致しません');
-                            isProcessing = false;
-                            return;
-                        }
-                    }
-
-                    // --- (5) 結果表示 ---
-                    firstQR = {
-                        text: qrRes.data,
-                        codewords: qrRes.codewords,
-                        managementCode: qrRes.managementCode,
-                        managementCode32: qrRes.managementCode32,
-                        creationDateTimeExt32: dmRes.creationDateTimeExt32,
-                        expiryExt32: dmRes.expiryExt32,
-                        readerIdExt32: dmRes.readerIdExt32,
-                        managementExt32: dmRes.managementExt32,
-                        locationLatExt24: dmRes.locationLatExt24,
-                        locationLonExt24: dmRes.locationLonExt24,
-                        municipalityExt24: dmRes.municipalityExt24,
-                        points: qrRes.location ? [
-                            qrRes.location.topLeftCorner,
-                            qrRes.location.topRightCorner,
-                            qrRes.location.bottomRightCorner,
-                            qrRes.location.bottomLeftCorner
-                        ] : null
-                    };
-                    qrMatrixDMData = dmRes;
-                    qrMatrixQRData = qrRes;
-
-                    // 電子署名モード: 署名 (QR 側 base64 42 bytes) を DM 全コード語 ハッシュで検証
-                    if (isDigitalSign) {
-                        await verifyQRMatrixDigitalSignature(qrRes, dmRes);
-                        isProcessing = false;
-                        return;
-                    }
-
-                    // --- 通常表示 ---
-                    showQRMatrixResult(dmRes, qrRes);
-                    isProcessing = false;
-                    return;
-                } catch (e) {
-                    console.error('QRマトリックスループエラー', e);
-                    isProcessing = false;
-                }
-            }
-            if (isScanning) requestAnimationFrame(scanLoop);
-        }
-
-        function looksLikeDigitalSignBase64(text) {
-            if (!text || typeof text !== 'string') return false;
-            // 42 bytes base64 → 56 文字 (パディング無し) or 56/60 文字
-            if (!/^[A-Za-z0-9+/=]{54,60}$/.test(text.trim())) return false;
-            try {
-                const raw = atob(text.trim());
-                return raw.length === 42;
-            } catch (e) { return false; }
-        }
-
-        async function verifyQRMatrixDigitalSignature(qrRes, dmRes) {
-            try {
-                const signBytes = new Uint8Array(atob(qrRes.data.trim()).split('').map(c => c.charCodeAt(0)));
-                if (signBytes.length !== 42) throw new Error('署名バイト長不正: ' + signBytes.length);
-                const keyId = (signBytes[0] << 8) | signBytes[1];
-                const sigR = signBytes.slice(2, 22);
-                const sigS = signBytes.slice(22, 42);
-
-                // DM の全コード語 (RS 訂正済) を SHA-256 → ECDSA 検証
-                const hashInput = new Uint8Array(dmRes.codewords);
-                const pubKeyHex = ECDSA_PUBLIC_KEYS[keyId];
-                let verified = false;
-                let senderName = '不明';
-                if (pubKeyHex) {
-                    senderName = (typeof ECDSA_SENDER_NAMES !== 'undefined' && ECDSA_SENDER_NAMES[keyId]) || ('ID:' + keyId);
-                    verified = ecdsaVerify(hashInput, sigR, sigS, pubKeyHex);
-                }
-                const imageDataId = dmRes.managementExt32 || 0;
-                const hasImageDataId = dmRes.managementExt32 !== undefined && dmRes.managementExt32 !== null;
-
-                // firstQR.text を DM の内容に差し替え (結果画面表示用)
-                if (firstQR) firstQR.text = dmRes.data || '';
-                showResultScreen({
-                    verified,
-                    senderName,
-                    imageDataId,
-                    hasImageDataId
-                });
-            } catch (e) {
-                console.error('電子署名検証エラー', e);
-                showResultScreen({ verified: false, senderName: 'エラー', imageDataId: 0, hasImageDataId: false });
-            }
-        }
-
-        function showQRMatrixResult(dmRes, qrRes) {
-            // 通常結果画面を流用 (第1QR → DM内容, 第2QR → QR内容)
-            isScanning = false;
-            document.getElementById('normalResultSection').style.display = '';
-            document.getElementById('digitalSignResultSection').style.display = 'none';
-            const title = document.getElementById('resultTitle');
-            title.innerText = 'QRマトリックス 読取結果';
-            title.style.color = '';
-
-            const label1 = document.getElementById('normalResultLabel1');
-            const label2 = document.getElementById('normalResultLabel2');
-            if (label1) label1.innerText = 'データマトリックス';
-            if (label2) label2.innerText = 'QRコード';
-
-            renderResultText('resText1', dmRes.data || '(空)');
-            renderResultText('resText2', qrRes.data || '(空)');
-
-            // 作成日時表示
-            renderCreationDateCard('normalCreationDateCard', 'normalCreationDateTime', dmRes.creationDateTimeExt32);
-
-            document.getElementById('resultScreen').style.display = 'flex';
-            if (navigator.vibrate) navigator.vibrate([40, 30, 40]);
         }
     </script>
 </body>
